@@ -1,6 +1,7 @@
 import WebSocket from 'ws';
 import TelegramBot from 'node-telegram-bot-api';
 import * as dotenv from 'dotenv';
+import { Kafka } from 'kafkajs';
 
 dotenv.config();
 
@@ -10,10 +11,13 @@ const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const TRENDING_PAIRS_URL = 'ws://34.107.31.9/ws/trending-pairs';
 const TOP_HOLDERS_URL = 'ws://34.107.31.9/ws/top-holders';
 const TOP_TRADERS_URL = 'ws://34.107.31.9/ws/top-traders';
+const KAFKA_BROKER = '34.107.31.9:9092';
+const KAFKA_TOPIC = 'bonding-curve-events';
 const TRENDING_TIMEOUT_SECONDS = 10;
 const MINT_TEST_TIMEOUT_SECONDS = 15;
 const MINT_BATCH_INTERVAL = 10000; // 20 seconds
 const MINTS_PER_BATCH = 30;
+const KAFKA_TIMEOUT_SECONDS = 2;
 
 if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
   console.error('❌ Error: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set in .env file');
@@ -43,6 +47,13 @@ let tradersTimeoutTimer: NodeJS.Timeout | null = null;
 let tradersLastMessageTime: Date | null = null;
 let tradersAlertSent = false;
 let tradersReconnectAttempts = 0;
+
+// State management for Kafka
+let kafkaTimeoutTimer: NodeJS.Timeout | null = null;
+let kafkaLastMessageTime: Date | null = null;
+let kafkaAlertSent = false;
+let kafkaConsumer: any = null;
+let kafkaConnected = false;
 
 // Mint management
 let availableMints: string[] = [];
@@ -328,6 +339,118 @@ function connectTopTraders() {
   }
 }
 
+// Reset timeout for Kafka
+function resetKafkaTimeout() {
+  if (kafkaTimeoutTimer) {
+    clearTimeout(kafkaTimeoutTimer);
+  }
+  
+  kafkaLastMessageTime = new Date();
+  kafkaAlertSent = false;
+  
+  kafkaTimeoutTimer = setTimeout(() => {
+    if (!kafkaAlertSent) {
+      const timeoutMessage = `⚠️ *Kafka Alert - Bonding Curve Events*\n\n` +
+        `No data received for ${KAFKA_TIMEOUT_SECONDS} seconds!\n` +
+        `Topic: \`${KAFKA_TOPIC}\`\n` +
+        `Last message: ${kafkaLastMessageTime?.toLocaleTimeString() || 'Never'}\n` +
+        `Connection: ${kafkaConnected ? 'Connected' : 'Disconnected'}`;
+      
+      sendAlert(timeoutMessage);
+      kafkaAlertSent = true;
+    }
+  }, KAFKA_TIMEOUT_SECONDS * 1000);
+}
+
+// Connect to Kafka and consume bonding-curve-events
+async function connectKafka() {
+  try {
+    console.log(`🔌 Connecting to Kafka: ${KAFKA_BROKER}`);
+    console.log(`📡 Topic: ${KAFKA_TOPIC}`);
+    
+    const kafka = new Kafka({
+      clientId: 'tg-alerts-bot',
+      brokers: [KAFKA_BROKER],
+      retry: {
+        retries: 10,
+        initialRetryTime: 300,
+        maxRetryTime: 30000
+      }
+    });
+
+    kafkaConsumer = kafka.consumer({ 
+      groupId: 'tg-alerts-group',
+      sessionTimeout: 10000,
+      rebalanceTimeout: 60000,
+      heartbeatInterval: 3000
+    });
+
+    await kafkaConsumer.connect();
+    console.log('✅ Kafka consumer connected');
+    kafkaConnected = true;
+
+    await kafkaConsumer.subscribe({ 
+      topic: KAFKA_TOPIC, 
+      fromBeginning: false 
+    });
+    console.log(`📡 Subscribed to topic: ${KAFKA_TOPIC}`);
+
+    // Start consuming
+    await kafkaConsumer.run({
+      eachMessage: async ({ topic, partition, message }: any) => {
+        try {
+          const timestamp = new Date().toLocaleTimeString();
+          const value = message.value?.toString() || '';
+          
+          // Parse message if it's JSON
+          let parsedValue;
+          try {
+            parsedValue = JSON.parse(value);
+            console.log(`📥 [${timestamp}] Kafka: ${topic} - Event received`);
+            if (parsedValue.type || parsedValue.event_type) {
+              console.log(`   Type: ${parsedValue.type || parsedValue.event_type}`);
+            }
+          } catch (e) {
+            console.log(`📥 [${timestamp}] Kafka: ${topic} - Event received (${value.substring(0, 50)}...)`);
+          }
+          
+          resetKafkaTimeout();
+        } catch (error) {
+          console.error('❌ Error processing Kafka message:', error);
+          resetKafkaTimeout(); // Reset timeout even on error to avoid false alerts
+        }
+      },
+    });
+
+    // Start the timeout monitoring
+    resetKafkaTimeout();
+    console.log(`⏱️  Kafka timeout monitoring started (${KAFKA_TIMEOUT_SECONDS}s)`);
+
+  } catch (error) {
+    console.error('❌ Failed to connect to Kafka:', error);
+    kafkaConnected = false;
+    
+    // Retry connection after delay
+    console.log('🔄 Retrying Kafka connection in 10s...');
+    setTimeout(connectKafka, 10000);
+  }
+}
+
+// Disconnect Kafka consumer
+async function disconnectKafka() {
+  try {
+    if (kafkaTimeoutTimer) {
+      clearTimeout(kafkaTimeoutTimer);
+    }
+    if (kafkaConsumer) {
+      await kafkaConsumer.disconnect();
+      console.log('🔌 Kafka consumer disconnected');
+    }
+  } catch (error) {
+    console.error('❌ Error disconnecting Kafka:', error);
+  }
+}
+
 // Process batch results after timeout
 function processBatchResults() {
   if (currentBatchMints.length === 0) {
@@ -427,11 +550,12 @@ bot.onText(/\/start/, (msg) => {
   const chatId = msg.chat.id;
   bot.sendMessage(
     chatId,
-    `🤖 *Multi-WebSocket Monitor Bot*\n\n` +
-    `Monitoring 3 endpoints:\n` +
+    `🤖 *Multi-WebSocket & Kafka Monitor Bot*\n\n` +
+    `Monitoring 4 endpoints:\n` +
     `• Trending Pairs (${TRENDING_TIMEOUT_SECONDS}s timeout)\n` +
     `• Top Holders (batch testing)\n` +
-    `• Top Traders (batch testing)\n\n` +
+    `• Top Traders (batch testing)\n` +
+    `• Kafka: ${KAFKA_TOPIC} (${KAFKA_TIMEOUT_SECONDS}s timeout)\n\n` +
     `Batch Testing:\n` +
     `• Tests ${MINTS_PER_BATCH} latest mints every ${MINT_BATCH_INTERVAL / 1000}s\n` +
     `• Waits ${MINT_TEST_TIMEOUT_SECONDS}s for responses\n` +
@@ -450,6 +574,7 @@ bot.onText(/\/status/, (msg) => {
   const trendingStatus = trendingWs?.readyState === WebSocket.OPEN ? '✅' : '❌';
   const holdersStatus = holdersWs?.readyState === WebSocket.OPEN ? '✅' : '❌';
   const tradersStatus = tradersWs?.readyState === WebSocket.OPEN ? '✅' : '❌';
+  const kafkaStatus = kafkaConnected ? '✅' : '❌';
   
   bot.sendMessage(
     chatId,
@@ -462,13 +587,15 @@ bot.onText(/\/status/, (msg) => {
     `Top Traders: ${tradersStatus}\n` +
     `Last msg: ${tradersLastMessageTime?.toLocaleTimeString() || 'Never'}\n` +
     `Responses: ${tradersResponses.size}/${currentBatchMints.length}\n\n` +
+    `Kafka (${KAFKA_TOPIC}): ${kafkaStatus}\n` +
+    `Last msg: ${kafkaLastMessageTime?.toLocaleTimeString() || 'Never'}\n\n` +
     `Available mints: ${availableMints.length}\n` +
     `Current batch: ${currentBatchMints.length} mints`,
     { parse_mode: 'Markdown' }
   );
 });
 
-bot.onText(/\/restart/, (msg) => {
+bot.onText(/\/restart/, async (msg) => {
   const chatId = msg.chat.id;
   bot.sendMessage(chatId, '🔄 Restarting all connections...');
   
@@ -476,6 +603,7 @@ bot.onText(/\/restart/, (msg) => {
   if (trendingWs) trendingWs.close(1000, 'Manual restart');
   if (holdersWs) holdersWs.close(1000, 'Manual restart');
   if (tradersWs) tradersWs.close(1000, 'Manual restart');
+  await disconnectKafka();
   
   // Reset reconnect attempts
   trendingReconnectAttempts = 0;
@@ -487,6 +615,7 @@ bot.onText(/\/restart/, (msg) => {
     connectTrendingPairs();
     connectTopHolders();
     connectTopTraders();
+    connectKafka();
   }, 1000);
 });
 
@@ -499,6 +628,9 @@ bot.onText(/\/info/, (msg) => {
     `Timeout: ${TRENDING_TIMEOUT_SECONDS}s\n\n` +
     `📡 Top Holders:\n\`${TOP_HOLDERS_URL}\`\n\n` +
     `📡 Top Traders:\n\`${TOP_TRADERS_URL}\`\n\n` +
+    `📡 Kafka:\n\`${KAFKA_BROKER}\`\n` +
+    `Topic: \`${KAFKA_TOPIC}\`\n` +
+    `Timeout: ${KAFKA_TIMEOUT_SECONDS}s\n\n` +
     `🔄 Batch Testing:\n` +
     `• Batch size: ${MINTS_PER_BATCH} mints\n` +
     `• Interval: ${MINT_BATCH_INTERVAL / 1000}s\n` +
@@ -528,7 +660,7 @@ bot.onText(/\/mints/, (msg) => {
 });
 
 // Handle graceful shutdown
-function shutdown() {
+async function shutdown() {
   console.log('\n👋 Shutting down...');
   
   if (trendingTimeoutTimer) clearTimeout(trendingTimeoutTimer);
@@ -538,6 +670,7 @@ function shutdown() {
   if (trendingWs) trendingWs.close(1000, 'Bot shutting down');
   if (holdersWs) holdersWs.close(1000, 'Bot shutting down');
   if (tradersWs) tradersWs.close(1000, 'Bot shutting down');
+  await disconnectKafka();
   
   bot.stopPolling();
   process.exit(0);
@@ -547,26 +680,29 @@ process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
 // Start the bot
-console.log('🤖 Multi-WebSocket Monitor Bot starting...');
+console.log('🤖 Multi-WebSocket & Kafka Monitor Bot starting...');
 console.log(`📡 Trending Pairs: ${TRENDING_PAIRS_URL} (${TRENDING_TIMEOUT_SECONDS}s timeout)`);
 console.log(`📡 Top Holders: ${TOP_HOLDERS_URL}`);
 console.log(`📡 Top Traders: ${TOP_TRADERS_URL}`);
+console.log(`📡 Kafka: ${KAFKA_BROKER} - Topic: ${KAFKA_TOPIC} (${KAFKA_TIMEOUT_SECONDS}s timeout)`);
 console.log(`🔄 Batch Testing: ${MINTS_PER_BATCH} mints every ${MINT_BATCH_INTERVAL / 1000}s (${MINT_TEST_TIMEOUT_SECONDS}s wait)\n`);
 
 // Initialize all connections
 connectTrendingPairs();
 connectTopHolders();
 connectTopTraders();
+connectKafka();
 
 // Start batch testing after connections are established
 startBatchTesting();
 
 sendAlert(
   `✅ *Bot Started*\n\n` +
-  `Monitoring 3 WebSocket endpoints:\n` +
+  `Monitoring 4 endpoints:\n` +
   `• Trending Pairs (${TRENDING_TIMEOUT_SECONDS}s timeout)\n` +
   `• Top Holders (batch testing)\n` +
-  `• Top Traders (batch testing)\n\n` +
+  `• Top Traders (batch testing)\n` +
+  `• Kafka: ${KAFKA_TOPIC} (${KAFKA_TIMEOUT_SECONDS}s timeout)\n\n` +
   `Testing ${MINTS_PER_BATCH} mints every ${MINT_BATCH_INTERVAL / 1000}s\n` +
   `Waiting ${MINT_TEST_TIMEOUT_SECONDS}s for responses`
 );
