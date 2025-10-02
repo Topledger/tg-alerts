@@ -55,6 +55,16 @@ let kafkaAlertSent = false;
 let kafkaConsumer: any = null;
 let kafkaConnected = false;
 
+// Message cleanup management
+interface StoredMessage {
+  messageId: number;
+  timestamp: Date;
+}
+let sentMessages: StoredMessage[] = [];
+let cleanupTimer: NodeJS.Timeout | null = null;
+const MESSAGE_RETENTION_HOURS = 24;
+const CLEANUP_INTERVAL_MS = 60 * 60 * 1000; // Run cleanup every hour
+
 // Mint management
 let availableMints: string[] = [];
 let currentBatchMints: string[] = [];
@@ -68,11 +78,62 @@ const maxReconnectAttempts = 10;
 // Send Telegram alert
 async function sendAlert(message: string) {
   try {
-    await bot.sendMessage(TELEGRAM_CHAT_ID, message, { parse_mode: 'Markdown' });
+    const sentMessage = await bot.sendMessage(TELEGRAM_CHAT_ID, message, { parse_mode: 'Markdown' });
+    
+    // Store message ID and timestamp for cleanup
+    sentMessages.push({
+      messageId: sentMessage.message_id,
+      timestamp: new Date()
+    });
+    
     console.log('📱 Alert sent:', message.substring(0, 50) + '...');
   } catch (error) {
     console.error('❌ Failed to send Telegram message:', error);
   }
+}
+
+// Cleanup old messages
+async function cleanupOldMessages() {
+  const now = new Date();
+  const cutoffTime = new Date(now.getTime() - MESSAGE_RETENTION_HOURS * 60 * 60 * 1000);
+  
+  console.log(`🧹 Running message cleanup... (deleting messages older than ${MESSAGE_RETENTION_HOURS}h)`);
+  
+  const messagesToDelete = sentMessages.filter(msg => msg.timestamp < cutoffTime);
+  const messagesToKeep = sentMessages.filter(msg => msg.timestamp >= cutoffTime);
+  
+  let deletedCount = 0;
+  let failedCount = 0;
+  
+  for (const msg of messagesToDelete) {
+    try {
+      await bot.deleteMessage(TELEGRAM_CHAT_ID, msg.messageId);
+      deletedCount++;
+      // Small delay to avoid rate limiting
+      await new Promise(resolve => setTimeout(resolve, 100));
+    } catch (error) {
+      failedCount++;
+      // Message might already be deleted or too old, ignore error
+    }
+  }
+  
+  sentMessages = messagesToKeep;
+  
+  console.log(`✅ Cleanup complete: ${deletedCount} deleted, ${failedCount} failed, ${messagesToKeep.length} kept`);
+}
+
+// Start message cleanup scheduler
+function startMessageCleanup() {
+  if (cleanupTimer) {
+    clearInterval(cleanupTimer);
+  }
+  
+  // Run cleanup immediately on start
+  setTimeout(cleanupOldMessages, 5000);
+  
+  // Then run every hour
+  cleanupTimer = setInterval(cleanupOldMessages, CLEANUP_INTERVAL_MS);
+  console.log(`🧹 Message cleanup scheduled (every ${CLEANUP_INTERVAL_MS / 1000 / 60} minutes, retention: ${MESSAGE_RETENTION_HOURS}h)`);
 }
 
 // Reset timeout for trending pairs
@@ -560,11 +621,15 @@ bot.onText(/\/start/, (msg) => {
     `• Tests ${MINTS_PER_BATCH} latest mints every ${MINT_BATCH_INTERVAL / 1000}s\n` +
     `• Waits ${MINT_TEST_TIMEOUT_SECONDS}s for responses\n` +
     `• Alerts on both success and failure\n\n` +
+    `🧹 Auto-Cleanup:\n` +
+    `• Messages deleted after ${MESSAGE_RETENTION_HOURS}h\n` +
+    `• Runs every hour automatically\n\n` +
     `Commands:\n` +
     `/status - Check all connections\n` +
     `/restart - Restart all connections\n` +
     `/info - Show configuration\n` +
-    `/mints - Show available mints`,
+    `/mints - Show available mints\n` +
+    `/cleanup - Manually cleanup old messages`,
     { parse_mode: 'Markdown' }
   );
 });
@@ -659,6 +724,13 @@ bot.onText(/\/mints/, (msg) => {
   }
 });
 
+bot.onText(/\/cleanup/, async (msg) => {
+  const chatId = msg.chat.id;
+  bot.sendMessage(chatId, '🧹 Running message cleanup now...');
+  await cleanupOldMessages();
+  bot.sendMessage(chatId, '✅ Cleanup complete! Check logs for details.');
+});
+
 // Handle graceful shutdown
 async function shutdown() {
   console.log('\n👋 Shutting down...');
@@ -666,6 +738,7 @@ async function shutdown() {
   if (trendingTimeoutTimer) clearTimeout(trendingTimeoutTimer);
   if (batchTimer) clearInterval(batchTimer);
   if (batchTimeoutTimer) clearTimeout(batchTimeoutTimer);
+  if (cleanupTimer) clearInterval(cleanupTimer);
   
   if (trendingWs) trendingWs.close(1000, 'Bot shutting down');
   if (holdersWs) holdersWs.close(1000, 'Bot shutting down');
@@ -696,6 +769,9 @@ connectKafka();
 // Start batch testing after connections are established
 startBatchTesting();
 
+// Start message cleanup scheduler
+startMessageCleanup();
+
 sendAlert(
   `✅ *Bot Started*\n\n` +
   `Monitoring 4 endpoints:\n` +
@@ -704,5 +780,6 @@ sendAlert(
   `• Top Traders (batch testing)\n` +
   `• Kafka: ${KAFKA_TOPIC} (${KAFKA_TIMEOUT_SECONDS}s timeout)\n\n` +
   `Testing ${MINTS_PER_BATCH} mints every ${MINT_BATCH_INTERVAL / 1000}s\n` +
-  `Waiting ${MINT_TEST_TIMEOUT_SECONDS}s for responses`
+  `Waiting ${MINT_TEST_TIMEOUT_SECONDS}s for responses\n\n` +
+  `🧹 Auto-cleanup: Messages deleted after ${MESSAGE_RETENTION_HOURS}h`
 );
