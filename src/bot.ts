@@ -17,7 +17,7 @@ const TRENDING_TIMEOUT_SECONDS = 10;
 const MINT_TEST_TIMEOUT_SECONDS = 15;
 const MINT_BATCH_INTERVAL = 10000; // 20 seconds
 const MINTS_PER_BATCH = 30;
-const KAFKA_TIMEOUT_SECONDS = 2;
+const KAFKA_TIMEOUT_SECONDS = 10; // Increased to tolerate consumer reconnections
 
 if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) {
   console.error('❌ Error: TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID must be set in .env file');
@@ -441,9 +441,15 @@ async function connectKafka() {
 
     kafkaConsumer = kafka.consumer({ 
       groupId: 'tg-alerts-group',
-      sessionTimeout: 10000,
+      sessionTimeout: 15000,      // 15s - within broker's allowed range
       rebalanceTimeout: 60000,
-      heartbeatInterval: 3000
+      heartbeatInterval: 3000,
+      maxWaitTimeInMs: 5000,      // Max time to wait for new data
+      retry: {
+        maxRetryTime: 30000,
+        initialRetryTime: 300,
+        retries: 8
+      }
     });
 
     await kafkaConsumer.connect();
@@ -481,6 +487,36 @@ async function connectKafka() {
           resetKafkaTimeout(); // Reset timeout even on error to avoid false alerts
         }
       },
+    });
+
+    // Handle consumer errors and crashes
+    kafkaConsumer.on('consumer.crash', (event: any) => {
+      console.error('⚠️ Kafka consumer crashed:', event.payload.error.message);
+      kafkaConnected = false;
+      
+      // Clear timeout timer to prevent false alerts during reconnection
+      if (kafkaTimeoutTimer) {
+        clearTimeout(kafkaTimeoutTimer);
+      }
+      
+      // Attempt reconnection
+      console.log('🔄 Reconnecting Kafka consumer...');
+      setTimeout(connectKafka, 5000);
+    });
+
+    kafkaConsumer.on('consumer.disconnect', () => {
+      console.log('🔌 Kafka consumer disconnected');
+      kafkaConnected = false;
+      
+      // Clear timeout to avoid false alerts
+      if (kafkaTimeoutTimer) {
+        clearTimeout(kafkaTimeoutTimer);
+      }
+    });
+
+    kafkaConsumer.on('consumer.connect', () => {
+      console.log('✅ Kafka consumer reconnected');
+      kafkaConnected = true;
     });
 
     // Start the timeout monitoring
